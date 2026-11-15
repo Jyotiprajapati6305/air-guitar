@@ -60,3 +60,35 @@ class Camera:
             self._cap.release()
             self._cap = None
             log.info("Camera released")
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+
+    camera = Camera()
+
+    try:
+        camera.open()
+        print("Camera started! Press 'q' to exit.")
+
+        while True:
+            frame = camera.read()
+
+            if frame is None:
+                continue
+
+            cv2.imshow("Air Guitar - Camera", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except CameraError as e:
+        print(f"Camera Error: {e}")
+
+    except KeyboardInterrupt:
+        print("Camera stopped by user.")
+
+    finally:
+        camera.release()
+        cv2.destroyAllWindows()
+        print("Camera closed successfully.")
