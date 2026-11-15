@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Air Guitar</title>
+<style>
+  :root { --bg:#0f1115; --fg:#e8eaf0; --muted:#9aa3b2; --accent:#ffb300; --card:#1a1d24; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,Segoe UI,Arial,sans-serif;
+         display:flex; flex-direction:column; align-items:center; padding:16px; min-height:100vh; }
+  h1 { margin:4px 0 2px; font-size:1.6rem; }
+  p.sub { margin:0 0 12px; color:var(--muted); text-align:center; max-width:640px; }
+  #stage { position:relative; width:100%; max-width:760px; background:#000; border-radius:12px; overflow:hidden; }
+  canvas { width:100%; display:block; aspect-ratio:4/3; }
+  #overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+             justify-content:center; gap:12px; background:rgba(0,0,0,.65); text-align:center; padding:16px; }
+  button { background:var(--accent); color:#111; border:0; border-radius:8px; padding:12px 22px;
+           font-size:1rem; font-weight:600; cursor:pointer; }
+  button.chord { background:var(--card); color:var(--fg); padding:8px 14px; font-weight:500; border:1px solid #333; }
+  button.chord.on { border-color:var(--accent); color:var(--accent); }
+  #msg { color:var(--muted); font-size:.9rem; min-height:1.2em; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; justify-content:center; margin-top:12px; align-items:center; }
+  table { border-collapse:collapse; margin-top:14px; color:var(--muted); font-size:.9rem; }
+  td, th { border:1px solid #2a2e38; padding:4px 10px; text-align:center; }
+  label { color:var(--muted); font-size:.9rem; }
+</style>
+</head>
+<body>
+<h1>🎸 Air Guitar</h1>
+<p class="sub"><b>Left hand</b>: raise 0–5 fingers to pick a chord. <b>Right hand</b>: sweep down or up to strum.
+   Everything runs in your browser — nothing is uploaded.</p>
+
+<div id="stage">
+  <canvas id="c" width="640" height="480"></canvas>
+  <div id="overlay">
+    <button id="start">Start camera &amp; play</button>
+    <div id="msg">Allow camera access when asked. Turn your volume up.</div>
+  </div>
+</div>
+
+<div class="row" id="chords"></div>
+<div class="row">
+  <label>Strum sensitivity
+    <input id="sens" type="range" min="0.4" max="1.8" step="0.05" value="0.9"></label>
+  <label><input id="downOnly" type="checkbox"> Down-strokes only</label>
+</div>
+<table>
+  <tr><th>Fingers up</th><td>0 (fist)</td><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td></tr>
+  <tr><th>Chord</th><td>Em</td><td>G</td><td>C</td><td>D</td><td>Am</td><td>A</td></tr>
+</table>
+<p class="sub" style="margin-top:10px">Keys 1–6 lock a chord, 0 returns to hand control. Tip: strum with a quick, confident sweep and return your hand slowly.</p>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+// ==== LOGIC START (pure functions, no DOM) ====
+const CFG = { strokeSpeed: 0.9, maxSpeed: 4.0, cooldown: 0.12, confirm: 2,
+              stagger: 0.012, chordConfirm: 4, window: 6, downOnly: false };
+
+const STRING_NAMES = ["E","A","D","G","B","e"];
+const OPEN_MIDI = [40, 45, 50, 55, 59, 64];
+const CHORDS = {
+  Em: [0,2,2,0,0,0], G: [3,2,0,0,0,3], C: [-1,3,2,0,1,0],
+  D: [-1,-1,0,2,3,2], Am: [-1,0,2,2,1,0], A: [-1,0,2,2,2,0],
+};
+const CHORD_ORDER = Object.keys(CHORDS);
+const chordForCount = n => CHORD_ORDER[Math.max(0, Math.min(n, CHORD_ORDER.length - 1))];
+const stringNote = (chord, s) => CHORDS[chord][s] < 0 ? null : OPEN_MIDI[s] + CHORDS[chord][s];
+function strumNotes(chord, dir) {
+  const order = dir === "down" ? [0,1,2,3,4,5] : [5,4,3,2,1,0];
+  return order.map(s => stringNote(chord, s)).filter(n => n !== null);
+}
+
+class OneEuro {
+  constructor(minCutoff = 1.2, beta = 2.0, dCutoff = 1.0) {
+    Object.assign(this, { minCutoff, beta, dCutoff }); this.reset();
+  }
+  reset() { this.x = this.dx = this.t = null; }
+  alpha(cutoff, dt) { const tau = 1 / (2 * Math.PI * cutoff); return 1 / (1 + tau / dt); }
+  filter(x, t) {
+    if (this.t === null) { this.x = x; this.dx = 0; this.t = t; return x; }
+    const dt = Math.max(t - this.t, 1e-3);
+    const ad = this.alpha(this.dCutoff, dt);
+    this.dx = ad * (x - this.x) / dt + (1 - ad) * this.dx;
+    const a = this.alpha(this.minCutoff + this.beta * Math.abs(this.dx), dt);
+    this.x = a * x + (1 - a) * this.x; this.t = t;
+    return this.x;
+  }
+}
+
+const dist = (a, b, aspect) => Math.hypot((a.x - b.x) * aspect, a.y - b.y);
+function extendedFingers(lm, aspect) {
+  const ext = [dist(lm[4], lm[17], aspect) > dist(lm[3], lm[17], aspect)];       // thumb
+  [[8,6],[12,10],[16,14],[20,18]].forEach(([tip, pip]) =>
+    ext.push(dist(lm[tip], lm[0], aspect) > dist(lm[pip], lm[0], aspect)));
+  return ext;
+}
+
+class PalmMotion {
+  constructor() { this.fx = new OneEuro(); this.fy = new OneEuro(); this.reset(); }
+  reset() { this.fx.reset(); this.fy.reset(); this.last = null; this.hist = []; }
+  update(lm, t, aspect) {
+    let cx = 0, cy = 0;
+    for (const i of [0,5,9,13,17]) { cx += lm[i].x; cy += lm[i].y; }
+    const x = this.fx.filter(cx / 5 * aspect, t), y = this.fy.filter(cy / 5, t);
+    if (this.last && t > this.last.t) {
+      const dt = t - this.last.t, clip = v => Math.max(-8, Math.min(8, v));
+      this.hist.push([clip((x - this.last.x) / dt), clip((y - this.last.y) / dt)]);
+      if (this.hist.length > CFG.window) this.hist.shift();
+    }
+    this.last = { x, y, t };
+    return this.hist.length < CFG.window ? null : this.hist.flat();
+  }
+}
+
+function ruleClassify(f) {
+  const vx = (f[10] + f[8]) / 2, vy = (f[11] + f[9]) / 2;
+  if (Math.abs(vy) < CFG.strokeSpeed || Math.abs(vy) < 1.2 * Math.abs(vx)) return 0;
+  return vy > 0 ? 1 : 2;               // 1 = down, 2 = up
+}
+
+class StrokeGate {
+  constructor() { this.reset(); }
+  reset() { this.cand = 0; this.run = 0; this.active = 0; this.lastEv = -1e9; }
+  update(f, t) {
+    const cls = ruleClassify(f);
+    this.run = cls === this.cand ? this.run + 1 : 1; this.cand = cls;
+    if (cls === 0) { if (this.run >= 2) this.active = 0; return null; }
+    if (cls !== this.active && this.run >= CFG.confirm && t - this.lastEv >= CFG.cooldown) {
+      this.active = cls; this.lastEv = t;
+      const peak = Math.max(...[1,3,5,7,9,11].slice(-3).map(i => Math.abs(f[i])));
+      const v = 0.3 + 0.7 * Math.min(1, Math.max(0, (peak - CFG.strokeSpeed) / (CFG.maxSpeed - CFG.strokeSpeed)));
+      return { direction: cls === 1 ? "down" : "up", velocity: v };
+    }
+    return null;
+  }
+}
+
+class ChordStabilizer {
+  constructor() { this.chord = CHORD_ORDER[0]; this.cand = null; this.run = 0; }
+  update(count) {
+    if (count !== null) {
+      this.run = count === this.cand ? this.run + 1 : 1; this.cand = count;
+      if (this.run >= CFG.chordConfirm) this.chord = chordForCount(count);
+    }
+    return this.chord;
+  }
+}
+
+// Karplus-Strong plucked string -> Float32Array in [-0.9, 0.9]
+function karplusStrong(freq, sr, seconds = 2.5, decay = 0.996) {
+  const n = Math.max(2, Math.round(sr / freq - 0.5));
+  const total = Math.floor(sr * seconds);
+  const buf = new Float32Array(n);
+  for (let i = 0; i < n; i++) buf[i] = Math.random() * 2 - 1;
+  const soft = new Float32Array(n);
+  for (let i = 0; i < n; i++) soft[i] = 0.5 * (buf[i] + buf[(i + n - 1) % n]);
+  let mean = 0; for (const v of soft) mean += v; mean /= n;
+  for (let i = 0; i < n; i++) buf[i] = soft[i] - mean;           // no DC offset
+  const out = new Float32Array(total);
+  let idx = 0;
+  for (let i = 0; i < total; i++) {
+    out[i] = buf[idx];
+    buf[idx] = decay * 0.5 * (buf[idx] + buf[(idx + 1) % n]);
+    idx = (idx + 1) % n;
+  }
+  const fade = Math.floor(0.05 * sr);
+  for (let i = 0; i < fade; i++) out[total - 1 - i] *= i / fade;
+  let peak = 1e-9; for (const v of out) peak = Math.max(peak, Math.abs(v));
+  for (let i = 0; i < total; i++) out[i] = out[i] / peak * 0.9;
+  return out;
+}
+const midiToFreq = m => 440 * Math.pow(2, (m - 69) / 12);
+// ==== LOGIC END ====
+
+// ---------- browser glue ----------
+const canvas = document.getElementById("c"), g = canvas.getContext("2d");
+const overlay = document.getElementById("overlay"), msg = document.getElementById("msg");
+const chordBox = document.getElementById("chords");
+let actx = null, master = null, landmarker = null, video = null;
+const cache = new Map();
+
+function noteBuffer(m) {
+  if (!cache.has(m)) {
+    const data = karplusStrong(midiToFreq(m), actx.sampleRate);
+    const b = actx.createBuffer(1, data.length, actx.sampleRate);
+    b.copyToChannel(data, 0); cache.set(m, b);
+  }
+  return cache.get(m);
+}
+function strum(notes, velocity) {
+  const t0 = actx.currentTime + 0.005;
+  notes.forEach((m, i) => {
+    const src = actx.createBufferSource(); src.buffer = noteBuffer(m);
+    const gain = actx.createGain(); gain.gain.value = velocity * (1 - 0.04 * i) * 0.8;
+    src.connect(gain).connect(master); src.start(t0 + i * CFG.stagger);
+  });
+}
+
+let manual = null, lastEv = null;
+const stabilizer = new ChordStabilizer(), gate = new StrokeGate(), palm = new PalmMotion();
+let singleRole = null, handInfo = "";
+
+CHORD_ORDER.forEach((name, i) => {
+  const b = document.createElement("button");
+  b.className = "chord"; b.textContent = `${i + 1}: ${name}`; b.dataset.name = name;
+  b.onclick = () => { if (actx) { manual = name; strum(strumNotes(name, "down"), 0.8); refreshButtons(); } };
+  chordBox.appendChild(b);
+});
+function refreshButtons() {
+  [...chordBox.children].forEach(b => b.classList.toggle("on", b.dataset.name === manual));
+}
+addEventListener("keydown", e => {
+  if (e.key >= "1" && e.key <= "6") { manual = CHORD_ORDER[+e.key - 1]; refreshButtons(); }
+  if (e.key === "0") { manual = null; refreshButtons(); }
+});
+document.getElementById("sens").oninput = e => CFG.strokeSpeed = +e.target.value;
+document.getElementById("downOnly").onchange = e => CFG.downOnly = e.target.checked;
+
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+              [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function assignHands(all) {
+  // Screen is mirrored, so the hand on the LEFT of the screen is your left hand.
+  const hands = all.map(lm => ({ lm, x: 1 - lm[0].x }));
+  let chordH = null, strumH = null;
+  if (hands.length >= 2) {
+    hands.sort((a, b) => a.x - b.x); chordH = hands[0]; strumH = hands[hands.length - 1];
+    singleRole = null;
+  } else if (hands.length === 1) {
+    const h = hands[0];
+    if (singleRole === "strum" && h.x < 0.35) singleRole = "chord";
+    else if (singleRole === "chord" && h.x > 0.55) singleRole = "strum";
+    else if (!singleRole) singleRole = h.x >= 0.45 ? "strum" : "chord";
+    if (singleRole === "strum") strumH = h; else chordH = h;
+  } else singleRole = null;
+  return { chordH, strumH };
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  if (!video || video.readyState < 2) return;
+  const W = canvas.width, H = canvas.height, aspect = W / H;
+  const t = performance.now() / 1000;
+  const res = landmarker.detectForVideo(video, performance.now());
+
+  const { chordH, strumH } = assignHands(res.landmarks || []);
+  const count = chordH ? extendedFingers(chordH.lm, aspect).filter(Boolean).length : null;
+  const chord = manual || stabilizer.update(count);
+  if (manual) stabilizer.update(count);
+
+  if (strumH) {
+    const feat = palm.update(strumH.lm, t, aspect);
+    const ev = feat ? gate.update(feat, t) : null;
+    if (ev && !(CFG.downOnly && ev.direction === "up")) {
+      strum(strumNotes(chord, ev.direction), ev.velocity); lastEv = { ...ev, t };
+    }
+  } else { palm.reset(); gate.reset(); }
+
+  // draw mirrored video, then overlays in screen space
+  g.save(); g.translate(W, 0); g.scale(-1, 1); g.drawImage(video, 0, 0, W, H); g.restore();
+  for (const h of [chordH, strumH]) {
+    if (!h) continue;
+    g.strokeStyle = h === strumH ? "#ffb300" : "#00c853"; g.lineWidth = 2;
+    for (const [a, b] of CONN) {
+      g.beginPath(); g.moveTo((1 - h.lm[a].x) * W, h.lm[a].y * H);
+      g.lineTo((1 - h.lm[b].x) * W, h.lm[b].y * H); g.stroke();
+    }
+    g.fillStyle = "#fff";
+    h.lm.forEach(p => { g.beginPath(); g.arc((1 - p.x) * W, p.y * H, 3, 0, 7); g.fill(); });
+  }
+  g.font = "bold 28px system-ui"; g.fillStyle = "#00e676";
+  g.fillText(`Chord: ${chord}${manual ? " (manual)" : ""}`, 12, 36);
+  g.font = "14px system-ui"; g.fillStyle = "#fff";
+  g.fillText(chordH ? `Left hand: ${count} finger(s) up` : "Left hand: not visible", 12, 58);
+  g.fillText(strumH ? "Right hand: strum down/up" : "Right hand: not visible", 12, 78);
+  if (lastEv && t - lastEv.t < 0.4) {
+    g.font = "bold 40px system-ui"; g.fillStyle = "#ffd54f";
+    g.fillText(lastEv.direction.toUpperCase(), W - 150, 50);
+    g.fillRect(W - 150, 62, 130 * lastEv.velocity, 10);
+  }
+}
+
+document.getElementById("start").onclick = async () => {
+  const btn = document.getElementById("start"); btn.disabled = true;
+  try {
+    msg.textContent = "Starting audio…";
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    master = actx.createGain(); master.gain.value = 0.9; master.connect(actx.destination);
+    await actx.resume();
+    for (const c of CHORD_ORDER) for (let s = 0; s < 6; s++) { const n = stringNote(c, s); if (n !== null) noteBuffer(n); }
+
+    msg.textContent = "Loading hand-tracking model (first time takes a few seconds)…";
+    const fileset = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    const opts = d => ({
+      baseOptions: { modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+        delegate: d },
+      runningMode: "VIDEO", numHands: 2,
+      minHandDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+    try { landmarker = await HandLandmarker.createFromOptions(fileset, opts("GPU")); }
+    catch { landmarker = await HandLandmarker.createFromOptions(fileset, opts("CPU")); }
+
+    msg.textContent = "Opening camera…";
+    video = document.createElement("video"); video.playsInline = true; video.muted = true;
+    video.srcObject = await navigator.mediaDevices.getUserMedia(
+      { video: { width: 640, height: 480, facingMode: "user" }, audio: false });
+    await video.play();
+    overlay.style.display = "none";
+    loop();
+  } catch (err) {
+    btn.disabled = false;
+    msg.textContent = "Could not start: " + (err && err.message ? err.message : err) +
+      " — allow camera access, close other apps using the webcam, and try again.";
+  }
+};
+
+// expose logic for tests
+window.__air = { CFG, PalmMotion, StrokeGate, ChordStabilizer, karplusStrong, midiToFreq, strumNotes, chordForCount, extendedFingers };
+</script>
+</body>
+</html>
